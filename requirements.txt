@@ -1,0 +1,7 @@
+numpy
+pandas
+pymongo
+tqdm
+scikit-learn
+prefixspan
+pyyaml

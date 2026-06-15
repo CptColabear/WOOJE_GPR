@@ -1,3 +1,6 @@
+# codex
+*.codex
+
 # Python
 __pycache__/
 *.py[cod]
