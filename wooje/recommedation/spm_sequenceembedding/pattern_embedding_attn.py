@@ -1,0 +1,795 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import math
+import random
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+
+import numpy as np
+from pymongo import MongoClient, UpdateOne
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+from prefixspan import PrefixSpan
+
+
+# =========================
+# 0. Config
+# =========================
+
+@dataclass
+class CFG:
+    # Mongo
+    host: str = "10.255.68.40"
+    port: int = 27017
+    username: str = ""  # empty means no auth
+    password: str = ""
+    db_name: str = "ejoow"
+    src_collection: str = "2. US_sequence_catlen_gt1_with_catid"  # note trailing space
+    out_collection: str = "user_tl_day_embeddings_v3_spm70"
+
+    # Tokens / vocab
+    pad_id: int = 0
+    n_items: int = 431         # category_id in [1..431]
+    mask_id: int = 432         # special token
+    vocab_size: int = 433      # 0..432
+
+    # Sequence / MLM
+    max_len: int = 16
+    mask_ratio: float = 0.5
+
+    # Model
+    d_model: int = 64
+    n_heads: int = 2
+    n_layers: int = 2
+    dropout: float = 0.1
+
+    # Train
+    seed: int = 42
+    batch_size: int = 512
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    epochs: int = 5
+    num_workers: int = 4
+
+    # SPM
+    spm_ratio: float = 0.7
+    min_pattern_len: int = 2
+    # attention pooling을 유지하기 위해 user×TL별 여러 SPM pattern을 임베딩 대상으로 사용
+    # 너무 많은 pattern 생성을 방지하려면 적절한 값으로 제한
+    max_patterns_per_user_tl: int = 20
+
+    # Device
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+cfg = CFG()
+print(cfg)
+
+
+# =========================
+# 1. Reproducibility & Mongo 연결
+# =========================
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(cfg.seed)
+
+
+def get_mongo_client(cfg: CFG) -> MongoClient:
+    # no auth case
+    if cfg.username == "" and cfg.password == "":
+        return MongoClient(cfg.host, cfg.port)
+    # auth case (if you later add username/pw)
+    return MongoClient(
+        host=cfg.host,
+        port=cfg.port,
+        username=cfg.username,
+        password=cfg.password,
+        authSource=cfg.db_name,
+    )
+
+client = get_mongo_client(cfg)
+db = client[cfg.db_name]
+src_col = db[cfg.src_collection]
+out_col = db[cfg.out_collection]
+
+print("src count:", src_col.estimated_document_count())
+
+
+# =========================
+# 2. 학습 샘플 로드
+# =========================
+
+def load_samples_from_mongo(src_col, limit: int = 0) -> List[Dict[str, Any]]:
+    q = {"has_missing_category_id": False}
+    proj = {"_id": 0, "user_id": 1, "TL": 1, "date": 1, "category_id_sequence": 1}
+    cur = src_col.find(q, proj)
+
+    samples = []
+    for doc in tqdm(cur, desc="Loading samples"):
+        seq = doc.get("category_id_sequence", [])
+        if seq is None:
+            continue
+        if len(seq) >= 2:
+            doc["user_id"] = str(doc["user_id"])
+            doc["TL"] = int(doc["TL"])
+            doc["category_id_sequence"] = [int(x) for x in seq]
+            samples.append(doc)
+        if limit and len(samples) >= limit:
+            break
+    return samples
+
+samples = load_samples_from_mongo(src_col, limit=0)  # limit=0 => all
+print("loaded samples:", len(samples))
+print("sample:", samples[0] if samples else None)
+
+
+# =========================
+# 3. Train/Val Split
+# =========================
+
+def train_val_split(samples: List[Dict[str, Any]], val_ratio=0.02):
+    samples = samples.copy()
+    random.shuffle(samples)
+    n = len(samples)
+    cut = int(n * (1 - val_ratio))
+    return samples[:cut], samples[cut:]
+
+train_samples, val_samples = train_val_split(samples, val_ratio=0.02)
+print("train:", len(train_samples), "val:", len(val_samples))
+
+
+# =========================
+# 4. MLM 마스킹 함수 & Dataset
+# =========================
+
+def make_mlm_example(seq: List[int], cfg: CFG) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # truncate to last max_len (recent)
+    seq = seq[-cfg.max_len:]
+    L = len(seq)
+
+    input_ids = seq.copy()
+    labels = [-100] * L
+
+    # choose mask positions
+    n_mask = max(1, int(round(L * cfg.mask_ratio)))
+    mask_positions = random.sample(range(L), k=min(n_mask, L))
+
+    for pos in mask_positions:
+        original = input_ids[pos]
+        labels[pos] = original
+
+        r = random.random()
+        if r < 0.8:
+            input_ids[pos] = cfg.mask_id
+        elif r < 0.9:
+            input_ids[pos] = random.randint(1, cfg.n_items)  # 1..431
+        else:
+            pass  # keep original
+
+    # pad to max_len
+    attn = [1] * L
+    if L < cfg.max_len:
+        pad_len = cfg.max_len - L
+        input_ids += [cfg.pad_id] * pad_len
+        labels += [-100] * pad_len
+        attn += [0] * pad_len
+
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(attn, dtype=torch.long),
+        torch.tensor(labels, dtype=torch.long),
+    )
+
+class SeqDataset(Dataset):
+    def __init__(self, rows: List[Dict[str, Any]], cfg: CFG, return_meta: bool = False):
+        self.rows = rows
+        self.cfg = cfg
+        self.return_meta = return_meta
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        doc = self.rows[idx]
+        seq = doc["category_id_sequence"]
+        input_ids, attn, labels = make_mlm_example(seq, self.cfg)
+        if not self.return_meta:
+            return input_ids, attn, labels
+        meta = {"user_id": doc["user_id"], "TL": doc["TL"], "date": doc["date"], "seq_len": len(seq)}
+        return input_ids, attn, labels, meta
+
+train_ds = SeqDataset(train_samples, cfg)
+val_ds = SeqDataset(val_samples, cfg)
+
+train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                          num_workers=cfg.num_workers, pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
+                        num_workers=cfg.num_workers, pin_memory=True)
+
+
+# =========================
+# 5. BERT4Rec 인코더 모델 (PyTorch)
+# =========================
+
+class BERT4RecEncoder(nn.Module):
+    def __init__(self, cfg: CFG):
+        super().__init__()
+        self.cfg = cfg
+        self.item_emb = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=cfg.pad_id)
+        self.pos_emb = nn.Embedding(cfg.max_len, cfg.d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.n_heads,
+            dim_feedforward=cfg.d_model * 4,
+            dropout=cfg.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.n_layers)
+
+        # MLM head: hidden -> vocab logits
+        self.mlm_head = nn.Linear(cfg.d_model, cfg.vocab_size)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        """
+        input_ids: (B, L)
+        attention_mask: (B, L), 1=valid, 0=pad
+        """
+        B, L = input_ids.shape
+        pos = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, L)
+
+        x = self.item_emb(input_ids) + self.pos_emb(pos)
+        x = F.dropout(x, p=self.cfg.dropout, training=self.training)
+
+        # Transformer key padding mask: True where PAD
+        key_padding_mask = (attention_mask == 0)  # (B, L)
+        h = self.encoder(x, src_key_padding_mask=key_padding_mask)  # (B, L, D)
+
+        logits = self.mlm_head(h)  # (B, L, V)
+        return logits, h
+
+model = BERT4RecEncoder(cfg).to(cfg.device)
+print(model)
+
+
+# =========================
+# 6. 학습 루프 (MLM)
+# =========================
+
+def evaluate_mlm(model, loader, cfg: CFG):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    ce = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
+
+    with torch.no_grad():
+        for input_ids, attn, labels in loader:
+            input_ids = input_ids.to(cfg.device, non_blocking=True)
+            attn = attn.to(cfg.device, non_blocking=True)
+            labels = labels.to(cfg.device, non_blocking=True)
+
+            logits, _ = model(input_ids, attn)  # (B, L, V)
+            loss = ce(logits.reshape(-1, cfg.vocab_size), labels.reshape(-1))
+            total_loss += loss.item()
+
+            # count masked tokens
+            total_tokens += (labels.reshape(-1) != -100).sum().item()
+
+    return total_loss / max(1, total_tokens)
+
+def train_mlm(model, train_loader, val_loader, cfg: CFG):
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    ce = nn.CrossEntropyLoss(ignore_index=-100)
+
+    best_val = float("inf")
+    best_path = "bert4rec_encoder_best.pt"
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs}")
+        running = 0.0
+        steps = 0
+
+        for input_ids, attn, labels in pbar:
+            input_ids = input_ids.to(cfg.device, non_blocking=True)
+            attn = attn.to(cfg.device, non_blocking=True)
+            labels = labels.to(cfg.device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+            logits, _ = model(input_ids, attn)
+            loss = ce(logits.reshape(-1, cfg.vocab_size), labels.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+
+            running += loss.item()
+            steps += 1
+            pbar.set_postfix(loss=running / steps)
+
+        val_loss = evaluate_mlm(model, val_loader, cfg)
+        print(f"[Epoch {epoch}] val_mlm_loss_per_masked_token = {val_loss:.4f}")
+
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(model.state_dict(), best_path)
+            print("  saved best checkpoint")
+
+    return best_path
+
+best_path = train_mlm(model, train_loader, val_loader, cfg)
+model.load_state_dict(torch.load(best_path, map_location=cfg.device))
+model.eval()
+
+
+# =========================
+# 7. Mean Pooling
+# =========================
+
+def mean_pooling(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    hidden: (B, L, D)
+    attention_mask: (B, L) with 1 for valid tokens, 0 for PAD
+    return: (B, D)
+    """
+    mask = attention_mask.unsqueeze(-1).float()
+    summed = (hidden * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return summed / denom
+
+
+# =========================
+# 8. SPM 기반 임베딩 입력 시퀀스 생성
+#    모델 설정/학습 방식은 그대로 두고, embedding 입력만 PrefixSpan pattern으로 변경
+# =========================
+
+def build_user_tl_sequences(samples: List[Dict[str, Any]]):
+    """
+    return:
+        user_tl_map[(user_id, TL)] = [
+            {"date": date, "seq": [cat1, cat2, ...]},
+            ...
+        ]
+    """
+    user_tl_map = defaultdict(list)
+
+    for doc in samples:
+        user_id = str(doc["user_id"])
+        TL = int(doc["TL"])
+        date = str(doc["date"])
+        seq = [int(x) for x in doc["category_id_sequence"]]
+
+        if len(seq) < 2:
+            continue
+
+        user_tl_map[(user_id, TL)].append({
+            "date": date,
+            "seq": seq,
+        })
+
+    # 날짜순 정렬
+    for key in user_tl_map:
+        user_tl_map[key].sort(key=lambda x: x["date"])
+
+    return user_tl_map
+
+
+def calc_min_support(n_sequences: int, ratio: float = 0.7) -> int:
+    """
+    Min_sup = 전체 user sequence 갯수의 70%
+    소수점 첫째자리에서 반올림
+    """
+    return max(1, int(round(n_sequences * ratio)))
+
+
+def extract_prefixspan_patterns(
+    seqs: List[List[int]],
+    min_support: int,
+    min_pattern_len: int = 2,
+    max_patterns: int = 20,
+):
+    """
+    PrefixSpan 결과:
+        [(support, pattern), ...]
+    """
+    ps = PrefixSpan(seqs)
+    patterns = ps.frequent(min_support)
+
+    # 길이가 너무 짧은 패턴 제거
+    patterns = [
+        (int(support), [int(x) for x in pattern])
+        for support, pattern in patterns
+        if len(pattern) >= min_pattern_len
+    ]
+
+    # 대표성 높은 패턴부터 정렬
+    # 1순위: support, 2순위: pattern 길이
+    patterns = sorted(patterns, key=lambda x: (x[0], len(x[1]), x[1]), reverse=True)
+
+    if max_patterns and max_patterns > 0:
+        patterns = patterns[:max_patterns]
+
+    return patterns
+
+
+user_tl_map = build_user_tl_sequences(samples)
+print("num user×TL groups:", len(user_tl_map))
+
+spm_rows = []
+
+for (user_id, TL), rows in tqdm(user_tl_map.items(), desc="Extracting PrefixSpan patterns"):
+    seqs = [r["seq"][-cfg.max_len:] for r in rows]
+    n_sequences = len(seqs)
+
+    if n_sequences <= 0:
+        continue
+
+    min_support = calc_min_support(n_sequences, cfg.spm_ratio)
+
+    patterns = extract_prefixspan_patterns(
+        seqs=seqs,
+        min_support=min_support,
+        min_pattern_len=cfg.min_pattern_len,
+        max_patterns=cfg.max_patterns_per_user_tl,
+    )
+
+    if not patterns:
+        continue
+
+    for pattern_idx, (support, pattern) in enumerate(patterns):
+        pattern = pattern[-cfg.max_len:]
+
+        spm_rows.append({
+            "user_id": user_id,
+            "TL": int(TL),
+            "pattern_idx": int(pattern_idx),
+            "pattern": [int(x) for x in pattern],
+            "pattern_len": len(pattern),
+            "support": int(support),
+            "n_sequences": int(n_sequences),
+            "min_support": int(min_support),
+            "support_ratio": float(support / n_sequences),
+        })
+
+print("num extracted SPM pattern rows:", len(spm_rows))
+print("sample spm row:", spm_rows[0] if spm_rows else None)
+
+
+# =========================
+# 9. SPM Pattern 임베딩 추출용 DataLoader
+# =========================
+
+class SPMPatternDataset(Dataset):
+    def __init__(self, rows: List[Dict[str, Any]], cfg: CFG):
+        self.rows = rows
+        self.cfg = cfg
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        doc = self.rows[idx]
+        seq_full = doc["pattern"]
+        seq = seq_full[-self.cfg.max_len:]
+        L = len(seq)
+
+        input_ids = seq + [self.cfg.pad_id] * (self.cfg.max_len - L)
+        attn = [1] * L + [0] * (self.cfg.max_len - L)
+
+        meta = {
+            "user_id": doc["user_id"],
+            "TL": int(doc["TL"]),
+            "pattern_idx": int(doc["pattern_idx"]),
+            "pattern": doc["pattern"],
+            "pattern_len": int(doc["pattern_len"]),
+            "support": int(doc["support"]),
+            "n_sequences": int(doc["n_sequences"]),
+            "min_support": int(doc["min_support"]),
+            "support_ratio": float(doc["support_ratio"]),
+        }
+
+        return (
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(attn, dtype=torch.long),
+            meta,
+        )
+
+
+def spm_collate_fn(batch):
+    input_ids = torch.stack([b[0] for b in batch], dim=0)
+    attn = torch.stack([b[1] for b in batch], dim=0)
+    metas = [b[2] for b in batch]
+    return input_ids, attn, metas
+
+
+spm_ds = SPMPatternDataset(spm_rows, cfg)
+spm_loader = DataLoader(
+    spm_ds,
+    batch_size=2048,
+    shuffle=False,
+    num_workers=cfg.num_workers,
+    pin_memory=True,
+    collate_fn=spm_collate_fn,
+)
+
+
+# =========================
+# 10. SPM Pattern 임베딩 + MongoDB 저장
+# =========================
+
+@torch.no_grad()
+def write_spm_embeddings_to_mongo(model, loader, cfg: CFG, out_col, upsert=True, chunk_size=5000):
+    model.eval()
+
+    # user_id, TL, pattern_idx 기준으로 SPM pattern embedding 저장
+    out_col.create_index([("user_id", 1), ("TL", 1), ("pattern_idx", 1)], unique=True)
+
+    ops = []
+    total_ops = 0
+
+    for input_ids, attn, metas in tqdm(loader, desc="Embedding SPM patterns & writing"):
+        input_ids = input_ids.to(cfg.device, non_blocking=True)
+        attn = attn.to(cfg.device, non_blocking=True)
+
+        # forward
+        _, h = model(input_ids, attn)      # (B, L, D)
+        z = mean_pooling(h, attn)          # (B, D)
+        z = F.normalize(z, p=2, dim=-1)    # L2 normalize
+
+        z_np = z.detach().cpu().numpy().astype(np.float32)
+
+        for i, meta in enumerate(metas):
+            user_id = str(meta["user_id"])
+            TL = int(meta["TL"])
+            pattern_idx = int(meta["pattern_idx"])
+
+            _id = f"{user_id}|{TL}|{pattern_idx}"
+
+            doc = {
+                "_id": _id,
+                "user_id": user_id,
+                "TL": TL,
+                "pattern_idx": pattern_idx,
+                "dim": int(cfg.d_model),
+                "embedding": z_np[i].tolist(),
+
+                # SPM metadata
+                "spm_method": "PrefixSpan",
+                "spm_ratio": float(cfg.spm_ratio),
+                "min_support": int(meta["min_support"]),
+                "support": int(meta["support"]),
+                "support_ratio": float(meta["support_ratio"]),
+                "n_sequences": int(meta["n_sequences"]),
+                "pattern": [int(x) for x in meta["pattern"]],
+                "pattern_len": int(meta["pattern_len"]),
+
+                "model": {
+                    "name": "BERT4Rec-Encoder-SPM-MeanPool",
+                    "max_len": cfg.max_len,
+                    "d_model": cfg.d_model,
+                    "n_layers": cfg.n_layers,
+                    "n_heads": cfg.n_heads,
+                }
+            }
+            ops.append(UpdateOne({"_id": _id}, {"$set": doc}, upsert=upsert))
+
+        if len(ops) >= chunk_size:
+            out_col.bulk_write(ops, ordered=False)
+            total_ops += len(ops)
+            ops = []
+
+    if ops:
+        out_col.bulk_write(ops, ordered=False)
+        total_ops += len(ops)
+
+    print("Done. bulk ops written:", total_ops)
+
+write_spm_embeddings_to_mongo(model, spm_loader, cfg, out_col, upsert=True, chunk_size=5000)
+
+print("SPM embedding out collection:", cfg.out_collection)
+print("SPM embedding out count:", out_col.estimated_document_count())
+print(out_col.find_one({}, {
+    "_id": 1,
+    "user_id": 1,
+    "TL": 1,
+    "pattern_idx": 1,
+    "pattern": 1,
+    "pattern_len": 1,
+    "support": 1,
+    "min_support": 1,
+    "n_sequences": 1,
+    "support_ratio": 1,
+    "dim": 1,
+    "embedding": {"$slice": 5},
+}))
+
+
+# =========================
+# 11. 패턴임베딩: Attention 기반 user×TL 최종 pattern embedding 생성
+# =========================
+
+# SPM pattern embedding 컬렉션
+seq_emb_col = db[cfg.out_collection]
+
+# 카테고리 선호 분포 컬렉션
+dist_col = db["3. US_user_TL_category_dist"]
+
+# 결과 저장 컬렉션
+pattern_col = db[f"user_tl_pattern_embeddings_attn_v2_spm{int(cfg.spm_ratio * 100)}"]
+
+print("seq_emb docs:", seq_emb_col.estimated_document_count())
+print("dist docs:", dist_col.estimated_document_count())
+print("pattern collection:", pattern_col.name)
+
+
+# 모델의 item embedding matrix: (vocab_size, d_model)
+# category_id는 1..431 사용
+model.eval()
+E = model.item_emb.weight.detach().cpu()  # torch tensor
+print("item embedding shape:", E.shape)
+
+
+# dist 컬렉션을 (user, TL) -> [(cat, count), ...]로 로드
+user_tl_to_dist = defaultdict(list)
+
+cur = dist_col.find({}, {"_id": 0, "user_id": 1, "TL": 1, "category_id": 1, "category_count": 1})
+for d in tqdm(cur, desc="Loading dist"):
+    user_id = str(d["user_id"])
+    TL = int(d["TL"])
+    cat = int(d["category_id"])      # 1..431
+    cnt = int(d["category_count"])
+    user_tl_to_dist[(user_id, TL)].append((cat, cnt))
+
+print("num user×TL with dist:", len(user_tl_to_dist))
+
+
+def build_query_vector(user_id: str, TL: int, E: torch.Tensor):
+    """
+    E: (vocab_size, d_model) on CPU
+    returns: q (d_model,) torch float32 on CPU or None
+    """
+    dist = user_tl_to_dist.get((user_id, TL), None)
+    if not dist:
+        return None
+
+    cats = [c for c, _ in dist]
+    cnts = np.array([cnt for _, cnt in dist], dtype=np.float32)
+    s = float(cnts.sum())
+    if s <= 0:
+        return None
+    p = cnts / s  # normalized preference
+
+    # weighted sum of embeddings
+    # E[cats] shape: (num_cats, d)
+    emb = E[cats].float()  # (n, d)
+    w = torch.from_numpy(p).unsqueeze(1)  # (n, 1)
+    q = (emb * w).sum(dim=0)  # (d,)
+
+    # L2 normalize
+    q = F.normalize(q, p=2, dim=0)
+    return q
+
+
+def attention_pool(q: torch.Tensor, V: torch.Tensor):
+    """
+    q: (d,)
+    V: (n, d) SPM pattern embeddings
+    returns: pattern (d,), weights (n,)
+    """
+    d = q.shape[0]
+    scores = (V @ q) / np.sqrt(d)   # dot product scaled
+    weights = torch.softmax(scores, dim=0)  # (n,)
+    pattern = (weights.unsqueeze(1) * V).sum(dim=0)  # (d,)
+    pattern = F.normalize(pattern, p=2, dim=0)
+    return pattern, weights
+
+
+pattern_col.create_index([("user_id", 1), ("TL", 1)], unique=True)
+
+
+def fetch_spm_pattern_embeddings(user_id: str, TL: int):
+    cur = seq_emb_col.find(
+        {"user_id": user_id, "TL": TL},
+        {
+            "_id": 0,
+            "pattern_idx": 1,
+            "pattern": 1,
+            "pattern_len": 1,
+            "support": 1,
+            "min_support": 1,
+            "n_sequences": 1,
+            "support_ratio": 1,
+            "embedding": 1,
+        }
+    ).sort("pattern_idx", 1)
+
+    rows = []
+    vecs = []
+    for d in cur:
+        rows.append(d)
+        vecs.append(d["embedding"])
+
+    if not vecs:
+        return None, None
+
+    V = torch.tensor(np.array(vecs, dtype=np.float32))  # (n, d)
+    return V, rows
+
+
+ops = []
+written = 0
+
+# dist가 있는 user×TL만 돌립니다(쿼리 벡터 없는 경우 방지)
+for (user_id, TL) in tqdm(list(user_tl_to_dist.keys()), desc="Building attention pattern embeddings"):
+    q = build_query_vector(user_id, TL, E)
+    if q is None:
+        continue
+
+    V, pattern_rows = fetch_spm_pattern_embeddings(user_id, TL)
+    if V is None:
+        continue
+
+    pattern, weights = attention_pool(q, V)
+
+    pattern_meta = []
+    for row, w in zip(pattern_rows, weights.detach().cpu().numpy().tolist()):
+        pattern_meta.append({
+            "pattern_idx": int(row.get("pattern_idx", -1)),
+            "pattern": [int(x) for x in row.get("pattern", [])],
+            "pattern_len": int(row.get("pattern_len", 0)),
+            "support": int(row.get("support", 0)),
+            "min_support": int(row.get("min_support", 0)),
+            "n_sequences": int(row.get("n_sequences", 0)),
+            "support_ratio": float(row.get("support_ratio", 0.0)),
+            "attn_weight": float(w),
+        })
+
+    doc = {
+        "_id": f"{user_id}|{TL}",
+        "user_id": user_id,
+        "TL": TL,
+        "dim": int(cfg.d_model),
+        "pattern_embedding": pattern.detach().cpu().numpy().astype(np.float32).tolist(),
+        "n_patterns": int(V.shape[0]),
+        "source_embedding_collection": cfg.out_collection,
+        "query_type": "category_dist_weighted_item_embedding",
+        "attn_type": "dot_softmax_scaled",
+        "spm_method": "PrefixSpan",
+        "spm_ratio": float(cfg.spm_ratio),
+        "patterns": pattern_meta,
+        "model_ref": {
+            "d_model": cfg.d_model,
+            "max_len": cfg.max_len,
+            "n_layers": cfg.n_layers,
+            "n_heads": cfg.n_heads,
+        }
+    }
+
+    ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True))
+
+    if len(ops) >= 5000:
+        pattern_col.bulk_write(ops, ordered=False)
+        written += len(ops)
+        ops = []
+
+if ops:
+    pattern_col.bulk_write(ops, ordered=False)
+    written += len(ops)
+
+print("done. upsert ops:", written)
+print("pattern_col count:", pattern_col.estimated_document_count())
+
+sample = pattern_col.find_one({}, {"_id": 0})
+if sample:
+    print(sample.keys(), sample["user_id"], sample["TL"], len(sample["pattern_embedding"]), sample["n_patterns"])
